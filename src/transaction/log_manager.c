@@ -11205,41 +11205,6 @@ cdc_get_undo_record (THREAD_ENTRY * thread_p, LOG_PAGE * log_page_p, LOG_LSA lsa
   return scan_code;
 }
 
-/*
- * cdc_log_read_advance_and_preserve_if_needed () - Fetch the next log page and preserve the existing one,
- *                                                  if the (lsa.offset + size) exceeds the log page size
- *
- * return                     : error code
- * thread_p (in)              : thread entry
- * size (in)                  : size to read in log page
- * lsa (in/out)               : log address to read
- * log_page_p (in/out)        : fetch the next log page if needed
- * preserved  (in/out)        : preserve existing log page if needed
- */
-static int
-cdc_log_read_advance_and_preserve_if_needed (THREAD_ENTRY * thread_p, size_t size, LOG_LSA * lsa, LOG_PAGE * log_page_p,
-					     LOG_PAGE * preserved)
-{
-  if (lsa->offset + size >= (int) LOGAREA_SIZE)
-    {
-      /* Before fetching the next page, current log page is required to be preserved */
-      memcpy (preserved, log_page_p, IO_MAX_PAGE_SIZE);
-
-      lsa->pageid++;
-
-      if (logpb_fetch_page (thread_p, lsa, LOG_CS_FORCE_USE, log_page_p) != NO_ERROR)
-	{
-	  logpb_fatal_error (thread_p, true, ARG_FILE_LINE,
-			     "log page fetch in cdc_log_read_advance_and_preserve_if_needed ()");
-	  return ER_FAILED;
-	}
-
-      lsa->offset = 0;
-    }
-
-  return NO_ERROR;
-}
-
 int
 cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recdes, LOG_LSA * redo_lsa,
 		RECDES * redo_recdes, bool is_flashback)
@@ -11248,11 +11213,10 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
   int tmpbuf_index;
 
   char *log_pgbuf[IO_MAX_PAGE_SIZE + MAX_ALIGNMENT];
-  char *preserved_log_pgbuf[IO_MAX_PAGE_SIZE + MAX_ALIGNMENT];
-  LOG_PAGE *log_page_p = NULL;	// log_page for process_lsa : when process_lsa is advanced, then next log_page can be fetched into this buffer
-  LOG_PAGE *preserved_log_page_p = NULL;	// log_page for redo/undo lsa
+  LOG_PAGE *log_page_p = NULL;
 
   LOG_LSA process_lsa = LSA_INITIALIZER;
+  LOG_LSA current_logrec_lsa = LSA_INITIALIZER;
   LOG_LSA prev_lsa = LSA_INITIALIZER;
 
   LOG_RECTYPE log_type;
@@ -11277,13 +11241,12 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 
   int error_code = NO_ERROR;
 
-  log_page_p = (LOG_PAGE *) PTR_ALIGN (log_pgbuf, MAX_ALIGNMENT);
-  preserved_log_page_p = (LOG_PAGE *) PTR_ALIGN (preserved_log_pgbuf, MAX_ALIGNMENT);
-
   /* Get UNDO RECDES from undo lsa */
 
   /* Because it is unable to know exact size of data (recdes.data), can not use log_get_undo_record. 
    * In order to use log_get_undo_record(), memory pool for recdes (assign_recdes_to_area()) is required just as scan cache where log_get_undo_record() is called. */
+
+  log_page_p = (LOG_PAGE *) PTR_ALIGN (log_pgbuf, MAX_ALIGNMENT);
 
   if (undo_lsa != NULL)
     {
@@ -11301,6 +11264,7 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	}
 
       LSA_COPY (&process_lsa, undo_lsa);
+      LSA_COPY (&current_logrec_lsa, undo_lsa);
 
       log_rec_hdr = LOG_GET_LOG_RECORD_HEADER (log_page_p, &process_lsa);
 
@@ -11316,7 +11280,7 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	{
 	case LOG_SUPPLEMENTAL_INFO:
 	  {
-	    scan_code = cdc_get_undo_record (thread_p, log_page_p, *undo_lsa, undo_recdes);
+	    scan_code = cdc_get_undo_record (thread_p, log_page_p, current_logrec_lsa, undo_recdes);
 	    if (scan_code != S_SUCCESS)
 	      {
 		error_code = ER_FAILED;
@@ -11330,21 +11294,15 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	  {
 	    LOG_REC_MVCC_UNDOREDO *mvcc_undoredo = NULL;
 
-	    if ((error_code =
-		 cdc_log_read_advance_and_preserve_if_needed (thread_p, sizeof (*mvcc_undoredo), &process_lsa,
-							      log_page_p, preserved_log_page_p)) != NO_ERROR)
-	      {
-		goto error;
-	      }
+	    LOG_READ_ADVANCE_WHEN_DOESNT_FIT (thread_p, sizeof (*mvcc_undoredo), &process_lsa, log_page_p);
 
 	    mvcc_undoredo = (LOG_REC_MVCC_UNDOREDO *) (log_page_p->area + process_lsa.offset);
 	    rcvindex = mvcc_undoredo->undoredo.data.rcvindex;
-
-	    log_page_p = process_lsa.pageid == undo_lsa->pageid ? log_page_p : preserved_log_page_p;
+	    undo_length = mvcc_undoredo->undoredo.ulength;
 
 	    if (rcvindex == RVHF_MVCC_DELETE_MODIFY_HOME || rcvindex == RVHF_UPDATE_NOTIFY_VACUUM)
 	      {
-		scan_code = cdc_get_undo_record (thread_p, log_page_p, *undo_lsa, undo_recdes);
+		scan_code = cdc_get_undo_record (thread_p, log_page_p, current_logrec_lsa, undo_recdes);
 		if (scan_code != S_SUCCESS)
 		  {
 		    error_code = ER_FAILED;
@@ -11360,22 +11318,15 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	  {
 	    LOG_REC_UNDOREDO *undoredo = NULL;
 
-	    if ((error_code =
-		 cdc_log_read_advance_and_preserve_if_needed (thread_p, sizeof (*undoredo), &process_lsa, log_page_p,
-							      preserved_log_page_p)) != NO_ERROR)
-	      {
-		goto error;
-	      }
+	    LOG_READ_ADVANCE_WHEN_DOESNT_FIT (thread_p, sizeof (*undoredo), &process_lsa, log_page_p);
 
 	    undoredo = (LOG_REC_UNDOREDO *) (log_page_p->area + process_lsa.offset);
 	    rcvindex = undoredo->data.rcvindex;
-
-	    /* if the next log page is fetched into log_page_p, then use the preserved_log_page_p */
-	    log_page_p = process_lsa.pageid == undo_lsa->pageid ? log_page_p : preserved_log_page_p;
+	    undo_length = undoredo->ulength;
 
 	    if (rcvindex == RVHF_DELETE || rcvindex == RVHF_UPDATE)
 	      {
-		scan_code = cdc_get_undo_record (thread_p, log_page_p, *undo_lsa, undo_recdes);
+		scan_code = cdc_get_undo_record (thread_p, log_page_p, current_logrec_lsa, undo_recdes);
 		if (scan_code != S_SUCCESS)
 		  {
 		    error_code = ER_FAILED;
@@ -11386,7 +11337,7 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	      {
 		/* GET OVF UNDO IMAGE */
 		if ((error_code =
-		     cdc_get_overflow_recdes (thread_p, log_page_p, undo_recdes, *undo_lsa, rcvindex,
+		     cdc_get_overflow_recdes (thread_p, log_page_p, undo_recdes, prev_lsa, RVOVF_PAGE_UPDATE,
 					      false)) != NO_ERROR)
 		  {
 		    goto error;
@@ -11400,18 +11351,10 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	  {
 	    LOG_REC_UNDO *undo = NULL;
 
-	    if ((error_code =
-		 cdc_log_read_advance_and_preserve_if_needed (thread_p, sizeof (*undo), &process_lsa, log_page_p,
-							      preserved_log_page_p)) != NO_ERROR)
-	      {
-		goto error;
-	      }
-
+	    LOG_READ_ADVANCE_WHEN_DOESNT_FIT (thread_p, sizeof (*undo), &process_lsa, log_page_p);
 	    undo = (LOG_REC_UNDO *) (log_page_p->area + process_lsa.offset);
 	    rcvindex = undo->data.rcvindex;
-
-	    /* if the next log page is fetched into log_page_p, then use the preserved_log_page_p */
-	    log_page_p = process_lsa.pageid == undo_lsa->pageid ? log_page_p : preserved_log_page_p;
+	    undo_length = undo->length;
 
 	    if (rcvindex == RVOVF_PAGE_UPDATE)
 	      {
@@ -11426,7 +11369,7 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	      }
 	    else if (rcvindex == RVHF_MVCC_UPDATE_OVERFLOW)
 	      {
-		scan_code = cdc_get_undo_record (thread_p, log_page_p, *undo_lsa, undo_recdes);
+		scan_code = cdc_get_undo_record (thread_p, log_page_p, current_logrec_lsa, undo_recdes);
 		if (scan_code != S_SUCCESS)
 		  {
 		    error_code = ER_FAILED;
@@ -11443,21 +11386,13 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	    LOG_REC_REDO *redo = NULL;
 	    LOG_RCVINDEX rcvindex;
 
-	    if ((error_code =
-		 cdc_log_read_advance_and_preserve_if_needed (thread_p, sizeof (*redo), &process_lsa, log_page_p,
-							      preserved_log_page_p)) != NO_ERROR)
-	      {
-		goto error;
-	      }
+	    LOG_READ_ADVANCE_WHEN_DOESNT_FIT (thread_p, sizeof (*redo), &process_lsa, log_page_p);
 
 	    redo = (LOG_REC_REDO *) (log_page_p->area + process_lsa.offset);
 	    rcvindex = redo->data.rcvindex;
 
 	    if (rcvindex == RVOVF_PAGE_UPDATE)
 	      {
-		/* if the next log page is fetched into log_page_p, then use the preserved_log_page_p */
-		log_page_p = process_lsa.pageid == undo_lsa->pageid ? log_page_p : preserved_log_page_p;
-
 		/* GET OVF UNDO IMAGE */
 		if ((error_code =
 		     cdc_get_overflow_recdes (thread_p, log_page_p, undo_recdes, *undo_lsa, rcvindex,
@@ -11503,6 +11438,7 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	}
 
       LSA_COPY (&process_lsa, redo_lsa);
+      LSA_COPY (&current_logrec_lsa, redo_lsa);
 
       log_rec_hdr = LOG_GET_LOG_RECORD_HEADER (log_page_p, &process_lsa);
 
@@ -11522,12 +11458,7 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	    LOG_REC_MVCC_UNDOREDO *mvcc_undoredo = NULL;
 	    LOG_RCVINDEX rcvindex;
 
-	    if ((error_code =
-		 cdc_log_read_advance_and_preserve_if_needed (thread_p, sizeof (*mvcc_undoredo), &process_lsa,
-							      log_page_p, preserved_log_page_p)) != NO_ERROR)
-	      {
-		goto error;
-	      }
+	    LOG_READ_ADVANCE_WHEN_DOESNT_FIT (thread_p, sizeof (*mvcc_undoredo), &process_lsa, log_page_p);
 
 	    mvcc_undoredo = (LOG_REC_MVCC_UNDOREDO *) (log_page_p->area + process_lsa.offset);
 	    rcvindex = mvcc_undoredo->undoredo.data.rcvindex;
@@ -11635,10 +11566,7 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 		/*if LOG_MVCC_UNDOREDO_DATA_DIFF , get undo data first and get diff */
 		if (is_diff)
 		  {
-		    char temp_buf[IO_MAX_PAGE_SIZE + MAX_ALIGNMENT] = "\0";
-		    LOG_PAGE *temp_pgptr = (LOG_PAGE *) PTR_ALIGN (temp_buf, MAX_ALIGNMENT);
-
-		    scan_code = cdc_get_undo_record (thread_p, temp_pgptr, *redo_lsa, &tmp_undo_recdes);
+		    scan_code = cdc_get_undo_record (thread_p, log_page_p, current_logrec_lsa, &tmp_undo_recdes);
 		    if (scan_code != S_SUCCESS)
 		      {
 			error_code = ER_FAILED;
@@ -11746,12 +11674,7 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	  {
 	    LOG_REC_UNDOREDO *undoredo = NULL;
 
-	    if ((error_code =
-		 cdc_log_read_advance_and_preserve_if_needed (thread_p, sizeof (*undoredo), &process_lsa, log_page_p,
-							      preserved_log_page_p)) != NO_ERROR)
-	      {
-		goto error;
-	      }
+	    LOG_READ_ADVANCE_WHEN_DOESNT_FIT (thread_p, sizeof (*undoredo), &process_lsa, log_page_p);
 
 	    undoredo = (LOG_REC_UNDOREDO *) (log_page_p->area + process_lsa.offset);
 	    rcvindex = undoredo->data.rcvindex;
@@ -11854,10 +11777,7 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 		/*if LOG_MVCC_UNDOREDO_DATA_DIFF , get undo data first and get diff */
 		if (is_diff)
 		  {
-		    char temp_buf[IO_MAX_PAGE_SIZE + MAX_ALIGNMENT] = "\0";
-		    LOG_PAGE *temp_pgptr = (LOG_PAGE *) PTR_ALIGN (temp_buf, MAX_ALIGNMENT);
-
-		    scan_code = cdc_get_undo_record (thread_p, temp_pgptr, *redo_lsa, &tmp_undo_recdes);
+		    scan_code = cdc_get_undo_record (thread_p, log_page_p, current_logrec_lsa, &tmp_undo_recdes);
 		    if (scan_code != S_SUCCESS)
 		      {
 			error_code = ER_FAILED;
@@ -11967,12 +11887,9 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	      }
 	    else if (rcvindex == RVOVF_CHANGE_LINK || rcvindex == RVOVF_NEWPAGE_LINK)
 	      {
-		/* if the next log page is fetched into log_page_p, then use the preserved_log_page_p */
-		log_page_p = process_lsa.pageid == redo_lsa->pageid ? log_page_p : preserved_log_page_p;
-
-		/* GET OVF REDO IMAGE */
+		/* GET OVF UNDO IMAGE */
 		if ((error_code =
-		     cdc_get_overflow_recdes (thread_p, log_page_p, redo_recdes, *redo_lsa, rcvindex,
+		     cdc_get_overflow_recdes (thread_p, log_page_p, redo_recdes, prev_lsa, RVOVF_PAGE_UPDATE,
 					      true)) != NO_ERROR)
 		  {
 		    goto error;
@@ -11987,21 +11904,11 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	    LOG_REC_REDO *redo = NULL;
 	    LOG_RCVINDEX rcvindex;
 
-	    if ((error_code =
-		 cdc_log_read_advance_and_preserve_if_needed (thread_p, sizeof (*redo), &process_lsa, log_page_p,
-							      preserved_log_page_p)) != NO_ERROR)
-	      {
-		goto error;
-	      }
-
 	    redo = (LOG_REC_REDO *) (log_page_p->area + process_lsa.offset);
 	    rcvindex = redo->data.rcvindex;
 
 	    if (rcvindex == RVOVF_NEWPAGE_INSERT || rcvindex == RVOVF_PAGE_UPDATE)
 	      {
-		/* if the next log page is fetched into log_page_p, then use the preserved_log_page_p */
-		log_page_p = process_lsa.pageid == redo_lsa->pageid ? log_page_p : preserved_log_page_p;
-
 		/* GET OVF REDO IMAGE */
 		if ((error_code =
 		     cdc_get_overflow_recdes (thread_p, log_page_p, redo_recdes, *redo_lsa, rcvindex,
@@ -12019,21 +11926,11 @@ cdc_get_recdes (THREAD_ENTRY * thread_p, LOG_LSA * undo_lsa, RECDES * undo_recde
 	    LOG_REC_UNDO *undo = NULL;
 	    LOG_RCVINDEX rcvindex;
 
-	    if ((error_code =
-		 cdc_log_read_advance_and_preserve_if_needed (thread_p, sizeof (*undo), &process_lsa, log_page_p,
-							      preserved_log_page_p)) != NO_ERROR)
-	      {
-		goto error;
-	      }
-
 	    undo = (LOG_REC_UNDO *) (log_page_p->area + process_lsa.offset);
 	    rcvindex = undo->data.rcvindex;
 
 	    if (rcvindex == RVOVF_PAGE_UPDATE)
 	      {
-		/* if the next log page is fetched into log_page_p, then use the preserved_log_page_p */
-		log_page_p = process_lsa.pageid == redo_lsa->pageid ? log_page_p : preserved_log_page_p;
-
 		if ((error_code =
 		     cdc_get_overflow_recdes (thread_p, log_page_p, redo_recdes, *redo_lsa, rcvindex,
 					      true)) != NO_ERROR)
@@ -12082,12 +11979,12 @@ error:
       free_and_init (tmp_undo_recdes.data);
     }
 
-  if (redo_recdes != NULL && redo_recdes->data != NULL)
+  if (redo_recdes->data != NULL)
     {
       free_and_init (redo_recdes->data);
     }
 
-  if (undo_recdes != NULL && undo_recdes->data != NULL)
+  if (undo_recdes->data != NULL)
     {
       free_and_init (undo_recdes->data);
     }
@@ -12242,11 +12139,10 @@ cdc_get_overflow_recdes (THREAD_ENTRY * thread_p, LOG_PAGE * log_page_p, RECDES 
 
   trid = current_log_record->trid;
 
-  if (((current_log_record->type == LOG_UNDO_DATA) && (rcvindex == RVOVF_PAGE_UPDATE) && is_redo)
-      || ((current_log_record->type == LOG_REDO_DATA) && (rcvindex == RVOVF_PAGE_UPDATE) && !is_redo)
-      || rcvindex == RVOVF_CHANGE_LINK || rcvindex == RVOVF_NEWPAGE_LINK)
+  if (((current_log_record->type == LOG_UNDO_DATA)
+       && (rcvindex == RVOVF_PAGE_UPDATE) && is_redo)
+      || ((current_log_record->type == LOG_REDO_DATA) && (rcvindex == RVOVF_PAGE_UPDATE) && !is_redo))
     {
-      /* start to traverse with prev_transla log record */
       LSA_COPY (&current_lsa, &current_log_record->prev_tranlsa);
 
       if (current_lsa.pageid != lsa.pageid)
@@ -12256,12 +12152,6 @@ cdc_get_overflow_recdes (THREAD_ENTRY * thread_p, LOG_PAGE * log_page_p, RECDES 
 	      error_code = ER_FAILED;
 	      goto end;
 	    }
-	}
-
-      if (rcvindex == RVOVF_CHANGE_LINK || rcvindex == RVOVF_NEWPAGE_LINK)
-	{
-	  /* rcvindex of previous log record is RVOVF_PAGE_UPDATE */
-	  rcvindex = RVOVF_PAGE_UPDATE;
 	}
     }
 
